@@ -3,8 +3,7 @@
 # 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
 
 from transformers import PretrainedConfig
-
-
+from typing import List, Tuple, Optional, Union
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
 
@@ -14,13 +13,13 @@ class MiniMindConfig(PretrainedConfig):
             bos_token_id: int = 1,
             eos_token_id: int = 2,
             hidden_act: str = 'silu',
-            hidden_size: int = 512,
+            hidden_size: int = 768,
             intermediate_size: int = None,
             max_position_embeddings: int = 32768,
-            num_attention_heads: int = 8,
+            num_attention_heads: int = 12,
             num_hidden_layers: int = 8,
             num_key_value_heads: int = 2,
-            vocab_size: int = 6400,
+            vocab_size: int = 6403,
             rms_norm_eps: float = 1e-05,
             rope_theta: int = 1000000.0,
             inference_rope_scaling: bool = False,
@@ -37,6 +36,7 @@ class MiniMindConfig(PretrainedConfig):
             aux_loss_alpha: float = 0.01,
             seq_aux: bool = True,
             norm_topk_prob: bool = True,
+            mrope_section: List[int] = [12, 10, 10],
             **kwargs
     ):
         super().__init__(**kwargs)
@@ -76,6 +76,7 @@ class MiniMindConfig(PretrainedConfig):
         self.aux_loss_alpha = aux_loss_alpha  # 辅助损失的alpha参数
         self.seq_aux = seq_aux  # 是否在序列级别上计算辅助损失
         self.norm_topk_prob = norm_topk_prob  # 是否标准化top-k概率
+        self.mrope_section = mrope_section  # MRoPE分段配置，默认为[12, 10, 10]，代表T/H/W轴的维度分配
 
 
 # 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
@@ -91,7 +92,12 @@ from transformers.activations import ACT2FN
 from typing import Optional, Tuple, List, Union
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from dataclasses import dataclass
 
+@dataclass
+class MyCausalLMOutputWithPast(CausalLMOutputWithPast):
+    # 显式添加 aux_loss 字段，这样 __init__ 就能识别它了
+    aux_loss: Optional[torch.FloatTensor] = None
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
@@ -105,47 +111,116 @@ class RMSNorm(torch.nn.Module):
     def forward(self, x):
         return self.weight * self._norm(x.float()).type_as(x)
 
+##修改
+# --- 1. 核心 MRoPE 实现类 (集成 YaRN 外推) ---
 
-def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6,
-                         rope_scaling: Optional[dict] = None):
-    freqs, attn_factor = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)), 1.0
-    if rope_scaling is not None:
-        orig_max, factor, beta_fast, beta_slow, attn_factor = (
-            rope_scaling.get("original_max_position_embeddings", 2048), rope_scaling.get("factor", 16),
-            rope_scaling.get("beta_fast", 32.0), rope_scaling.get("beta_slow", 1.0), rope_scaling.get("attention_factor", 1.0)
-        )
-        if end / orig_max > 1.0:
-            # YaRN: f'(i) = f(i)((1-γ) + γ/s), where γ∈[0,1] is linear ramp
-            inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
-            low, high = max(math.floor(inv_dim(beta_fast)), 0), min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
-            ramp = torch.clamp((torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001), 0, 1)
-            freqs = freqs * (1 - ramp + ramp / factor)
+class MiniMindMRoPE(nn.Module):
+    def __init__(self, config, device=None):
+        super().__init__()
+        # 默认分段：例如 head_dim=64 (512//8), 则dim=head_dim//2=32, 分配为 T:12, H:10, W:10
+        self.mrope_section = getattr(config, "mrope_section", [12, 10, 10])
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.rope_theta = getattr(config, "rope_theta", 1000000.0)
+        
+        #end
+        self.end=config.max_position_embeddings
+    
+        # 基础频率计算
+        dim = self.head_dim // 2
+        inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, dim, 1).float() / dim))#[dim]
+        self.attention_scaling = 1.0
 
-    t = torch.arange(end, device=freqs.device)
-    freqs = torch.outer(t, freqs).float()
-    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
-    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
-    return freqs_cos, freqs_sin
+        # --- YaRN 缩放逻辑 ---
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if rope_scaling is not None and rope_scaling.get("type") == "yarn":
+            # 获取 YaRN 参数
+            original_max = rope_scaling.get("original_max_position_embeddings", 2048)
+            factor = rope_scaling.get("factor", 16.0)
+            beta_fast = rope_scaling.get("beta_fast", 32.0)
+            beta_slow = rope_scaling.get("beta_slow", 1.0)
+            self.attention_scaling = rope_scaling.get("attention_factor", 1.0)
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    def rotate_half(x):
-        return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
+            if self.end /original_max>1.0:#只有当外推长度超过原始最大位置编码长度时才应用 YaRN 频率修正
+                # YaRN 频率修正公式
+                # 计算受影响的维度范围
+                def inv_dim_fn(b):
+                    return (dim * math.log(original_max / (b * 2 * math.pi))) / (2 * math.log(self.rope_theta))
+                
+                low = max(math.floor(inv_dim_fn(beta_fast)), 0)
+                high = min(math.ceil(inv_dim_fn(beta_slow)), dim - 1)
+                
+                # 生成插值系数 ramp
+                if high != low:
+                    ramp = torch.clamp((torch.arange(dim).float() - low) / (high - low), 0, 1)
+                else:
+                    ramp = torch.zeros(dim).float()
+                    
+                # 应用缩放：(1-ramp) 部分保持原样，ramp 部分乘以 1/factor
+                # 实际上在 YaRN 中，频率越低对应的维度索引越大
+                inv_freq = inv_freq * (1 - ramp + ramp / factor)
 
-    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
-    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def apply_interleaved_mrope(self, freqs, mrope_section):
+        """将 [3, bs, sl, d] 的频率交错合并为 [bs, sl, d]"""
+        freqs = freqs.contiguous()   # 【修改8】确保内存连续
+        freqs_t = freqs[0].clone()   # 必须使用 clone 防止原地修改(inplace)导致异常
+        for dim, offset in enumerate((1, 2), start=1):  # 依次处理 H 和 W 轴
+            length = mrope_section[dim] * 3
+            idx = slice(offset, length, 3)
+            freqs_t[..., idx] = freqs[dim, ..., idx]
+        return freqs_t
+
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        """
+        position_ids: [3, batch, seq_len] 代表 T, H, W 坐标
+        """
+        # 1. 扩展维度以进行矩阵乘法
+        inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1)
+        position_ids_expanded = position_ids[:, :, None, :].float()
+
+        # 2. 计算各轴旋转角度: [3, bs, seq_len, head_dim//2]
+        freqs = (inv_freq_expanded @ position_ids_expanded).transpose(2, 3)
+        
+        # 3. 交错合并信息 (MRoPE 核心逻辑)
+        freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
+        
+        # 4. 拼接并生成 cos/sin
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos() * self.attention_scaling
+        sin = emb.sin() * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+# --- 2. 辅助函数 ---
+
+def rotate_half(x):
+    """标准旋转操作"""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    """将旋转编码应用到 Q 和 K"""
+    # 假设输入形状为 [bs, sl, heads, head_dim]
+    cos = cos.unsqueeze(2) 
+    sin = sin.unsqueeze(2)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
-    bs, slen, num_key_value_heads, head_dim = x.shape
+    """【修改1】适配标准KV shape: [bs, n_kv_heads, slen, head_dim]"""
+    bs, n_kv_heads, slen, head_dim = x.shape
     if n_rep == 1:
         return x
     return (
-        x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+        x[:, :, None, :, :].expand(bs, n_kv_heads, n_rep, slen, head_dim)
+        .reshape(bs, n_kv_heads * n_rep, slen, head_dim)
     )
-
 
 class Attention(nn.Module):
     def __init__(self, args: MiniMindConfig):
@@ -181,22 +256,36 @@ class Attention(nn.Module):
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
 
-        # kv_cache实现
+        # 【修改2】转置为标准 HF KV Cache 形状: [bsz, heads, seq_len, head_dim]
+        xq = xq.transpose(1, 2)
+        xk = xk.transpose(1, 2)
+        xv = xv.transpose(1, 2)
+        
+        # 【修改3】兼容 Transformers DynamicCache 对象和传统 Tuple 缓存
+        # 【替换 Attention.forward 中处理 Cache 的逻辑】
         if past_key_value is not None:
-            xk = torch.cat([past_key_value[0], xk], dim=1)
-            xv = torch.cat([past_key_value[1], xv], dim=1)
-        past_kv = (xk, xv) if use_cache else None
-
-        xq, xk, xv = (
-            xq.transpose(1, 2),
-            repeat_kv(xk, self.n_rep).transpose(1, 2),
-            repeat_kv(xv, self.n_rep).transpose(1, 2)
-        )
-
-        if self.flash and (seq_len > 1) and (past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
-            output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+            if hasattr(past_key_value, "update"): # 兼容新版 DynamicCache 对象
+                xk, xv = past_key_value.update(xk, xv, self.layer_id)
+                past_kv = past_key_value
+            # 【修复点】不仅要是 tuple，且里面的元素不能是 None
+            elif isinstance(past_key_value, tuple) and past_key_value[0] is not None: 
+                xk = torch.cat([past_key_value[0], xk], dim=2)
+                xv = torch.cat([past_key_value[1], xv], dim=2)
+                past_kv = (xk, xv) if use_cache else None
+            else:
+                past_kv = (xk, xv) if use_cache else None
         else:
-            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            past_kv = (xk, xv) if use_cache else None
+        
+        # repeat_kv 现已接收并返回 [bsz, heads, seq_len, head_dim]
+        xk_rep = repeat_kv(xk, self.n_rep)
+        xv_rep = repeat_kv(xv, self.n_rep)
+        
+        if self.flash and (seq_len > 1) and (past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+            output = F.scaled_dot_product_attention(xq, xk_rep, xv_rep, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+        else:
+            # 注意这里: xk_rep.transpose(-2, -1) 变为 [bsz, n_heads, head_dim, kv_len]
+            scores = (xq @ xk_rep.transpose(-2, -1)) / math.sqrt(self.head_dim)
             scores[:, :, :, -seq_len:] += torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=scores.device), diagonal=1)
 
             if attention_mask is not None:
@@ -206,9 +295,10 @@ class Attention(nn.Module):
 
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
-            output = scores @ xv
+            output = scores @ xv_rep # [bsz, n_heads, seq_len, head_dim]
 
-        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        # 恢复形状: [bsz, seq_len, hidden_size]
+        output = output.transpose(1, 2).contiguous().reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
 
@@ -358,23 +448,38 @@ class MiniMindBlock(nn.Module):
         self.self_attn = Attention(config)
 
         self.layer_id = layer_id
+        # 【修改4】注入 layer_id 给 attention，供 DynamicCache 使用
+        self.self_attn.layer_id = layer_id
+        
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
-    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None,
+                visual_pos_masks=None, deepstack_visual_embed=None #修改for多模态
+                ):  
         residual = hidden_states
         hidden_states, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states), position_embeddings,
             past_key_value, use_cache, attention_mask
         )
         hidden_states += residual
+        
+        #修改for多模态
+        # --- DeepStack 视觉残差注入 ---
+        if deepstack_visual_embed is not None and visual_pos_masks is not None:
+            visual_pos_masks = visual_pos_masks.to(hidden_states.device)
+            deepstack_visual_embed = deepstack_visual_embed.to(hidden_states.dtype).to(hidden_states.device)
+            local_hidden = hidden_states[visual_pos_masks, :].clone() + deepstack_visual_embed
+            hidden_states[visual_pos_masks, :] = local_hidden
+        # ------------------------------
+        
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states, present_key_value
 
 
 class MiniMindModel(nn.Module):
-    def __init__(self, config: MiniMindConfig):
+    def __init__(self, config: MiniMindConfig,):
         super().__init__()
         self.config = config
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
@@ -383,45 +488,70 @@ class MiniMindModel(nn.Module):
         self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
-                                                    end=config.max_position_embeddings, rope_base=config.rope_theta,
-                                                    rope_scaling=config.rope_scaling)
-        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
-        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+        self.mrope_emb=MiniMindMRoPE(config)
 
-    def forward(self,
-                input_ids: Optional[torch.Tensor] = None,
-                attention_mask: Optional[torch.Tensor] = None,
-                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
-                use_cache: bool = False,
+    def forward(self, input_ids: Optional[torch.Tensor] = None, positions_ids: Optional[torch.Tensor] = None, 
+                attention_mask=None, past_key_values=None, use_cache=False,
+                inputs_embeds: Optional[torch.Tensor] = None, #修改for多模态：加入嵌入
+                visual_pos_masks: Optional[torch.Tensor] = None,
+                deepstack_visual_embeds: Optional[List[torch.Tensor]] = None,
                 **kwargs):
-        batch_size, seq_length = input_ids.shape
-        if hasattr(past_key_values, 'layers'): past_key_values = None
-        past_key_values = past_key_values or [None] * len(self.layers)
-        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+    
+    
+        # 🚀 修复补丁：强制从 kwargs 中兜底获取，防止 Python 传参丢失
+        if inputs_embeds is None and "inputs_embeds" in kwargs:
+            inputs_embeds = kwargs["inputs_embeds"]
+            
+        # 修改for多模态支持从 inputs_embeds 直接输入
+        if inputs_embeds is None:
+            hidden_states = self.dropout(self.embed_tokens(input_ids))
+        else:
+            hidden_states = self.dropout(inputs_embeds)
+        
+        cos, sin = self.mrope_emb(hidden_states, positions_ids)
+        position_embeddings = (cos, sin)
 
-        hidden_states = self.dropout(self.embed_tokens(input_ids))
+        # 【修复点】建立新的缓存收集器
+        presents = [] if use_cache else None
 
-        position_embeddings = (
-            self.freqs_cos[start_pos:start_pos + seq_length],
-            self.freqs_sin[start_pos:start_pos + seq_length]
-        )
+        for layer_idx, layer in enumerate(self.layers):
+            # --- 智能分发 Cache ---
+            if past_key_values is None:
+                layer_past_key_value = None
+            elif hasattr(past_key_values, "update"): 
+                # 如果是 DynamicCache 对象，直接把原对象传给 Attention 让它自己调用 update
+                layer_past_key_value = past_key_values
+            else:
+                # 如果是传统的 Tuple 列表，安全地取当前层
+                layer_past_key_value = past_key_values[layer_idx] if layer_idx < len(past_key_values) else None
 
-        presents = []
-        for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
+            #修改for多模态
+            # 提取当前层的 DeepStack 特征
+            layer_deepstack_embed = None
+            if deepstack_visual_embeds is not None and layer_idx < len(deepstack_visual_embeds):
+                layer_deepstack_embed = deepstack_visual_embeds[layer_idx]
+                
             hidden_states, present = layer(
                 hidden_states,
                 position_embeddings,
-                past_key_value=past_key_value,
+                past_key_value=layer_past_key_value,
                 use_cache=use_cache,
                 attention_mask=attention_mask
             )
-            presents.append(present)
+            
+            if presents is not None:
+                presents.append(present)
 
         hidden_states = self.norm(hidden_states)
 
+        # --- 智能返回 Cache ---
+        if hasattr(past_key_values, "update"):
+            next_cache = past_key_values # DynamicCache 自己维护了状态，直接返回它
+        else:
+            next_cache = tuple(presents) if presents is not None else None
+
         aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
-        return hidden_states, presents, aux_loss
+        return hidden_states, next_cache, aux_loss # 注意这里返回 next_cache
 
 
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
@@ -433,9 +563,65 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         self.model = MiniMindModel(self.config)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.model.embed_tokens.weight = self.lm_head.weight
+        
+    # 【修改7】添加此方法，确保自回归时 positions_ids 长度与 input_ids 同步自增
+    def _update_model_kwargs_for_generation(self, outputs, model_kwargs, is_encoder_decoder=False, **kwargs):
+        model_kwargs = super()._update_model_kwargs_for_generation(
+            outputs, model_kwargs, is_encoder_decoder=is_encoder_decoder, **kwargs
+        )
+        if "positions_ids" in model_kwargs and model_kwargs["positions_ids"] is not None:
+            positions_ids = model_kwargs["positions_ids"]
+            
+            # 1. 拷贝最后一个 token 的 3D 坐标，形状: [3, batch, 1]
+            new_pos = positions_ids[:, :, -1:].clone()
+            
+            #所有维度加1，因为训练的是文本decoder，保证T W H同步增长相当于一维RoPE
+            new_pos += 1 
+            
+            # 3. 拼接到历史位置编码后面
+            model_kwargs["positions_ids"] = torch.cat([positions_ids, new_pos], dim=-1)
+            
+        return model_kwargs
+    
+        # 👇 新增这个函数，用于适配 transformers 的 generate 方法
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs):
+        positions_ids = kwargs.get("positions_ids", None)
+        
+        # 【修复点】必须检查 cache 里面到底有没有存东西，不能只判断 is not None
+        cache_length = 0
+        if past_key_values is not None:
+            if hasattr(past_key_values, "get_seq_length"): # DynamicCache API
+                cache_length = past_key_values.get_seq_length()
+            elif isinstance(past_key_values, tuple) and len(past_key_values) > 0 and past_key_values[0] is not None and past_key_values[0][0] is not None:
+                # 传统 Tuple 取张量长度 (dim=2 此时是 seq_len)
+                cache_length = past_key_values[0][0].shape[2] 
+                
+        # 只有真正处于 Decode 阶段（拥有过去记忆），才把 input_ids 削减为 1
+        if cache_length > 0:
+            input_ids = input_ids[:, -1:]
+            if positions_ids is not None:
+                positions_ids = positions_ids[:, :, -1:]
+
+        return {
+            "input_ids": input_ids,
+            "positions_ids": positions_ids,
+            "past_key_values": past_key_values,
+            "use_cache": kwargs.get("use_cache"),
+            "attention_mask": attention_mask,
+        }
+
+    # 同时也建议重写这个方法，以便 generate 正确处理 KV-Cache 的更新
+    def _reorder_cache(self, past_key_values, beam_idx):
+        reordered_past = ()
+        for layer_past in past_key_values:
+            reordered_past += (
+                tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
+            )
+        return reordered_past
 
     def forward(self,
                 input_ids: Optional[torch.Tensor] = None,
+                positions_ids: Optional[torch.Tensor] = None,#[3, batch, seq_len]
                 attention_mask: Optional[torch.Tensor] = None,
                 labels: Optional[torch.Tensor] = None,
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
@@ -444,6 +630,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
                 **args):
         hidden_states, past_key_values, aux_loss = self.model(
             input_ids=input_ids,
+            positions_ids=positions_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
@@ -458,6 +645,10 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             shift_labels = labels[..., 1:].contiguous()
             loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
 
-        output = CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
-        output.aux_loss = aux_loss
+        output = MyCausalLMOutputWithPast(loss=loss,
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+            aux_loss=aux_loss,
+        )
         return output

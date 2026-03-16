@@ -1,4 +1,25 @@
-model/__pycache__
-out
+# Python 缓存
+**/__pycache__/
+.cache/
+
+# 训练输出与检查点
+out/
+checkpoints/
+
+# 特定项目目录（如 MiniMind 相关）
 website/
 docs-minimind/
+
+# 数据集与临时文件
+dataset/__pycache__/
+dataset/.cache/
+*.jsonl
+*.parquet
+
+# 模型权重文件（重点：防止大文件上传）
+*.pth
+*.pt
+*.bin
+
+# 虚拟环境
+.venv/
