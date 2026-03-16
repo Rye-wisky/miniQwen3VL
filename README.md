@@ -28,7 +28,7 @@
 
 ### 0. 准备工作
 
-首先运行脚本提取 Qwen3VL 的视觉组件：
+首先运行脚本提取 Qwen3VL 的视觉组件, 运行前确保将Qwen3VL-2B-Instruct下载到本地./Qwen3VL-2B：
 
 ```
 python extract.py
