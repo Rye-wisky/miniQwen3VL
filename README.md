@@ -22,6 +22,19 @@
 
 > **总结自述**：目前模型在 Stage 0 表现最像“人”，由于语言侧参数仅 90M，Stage 1/2 后的对齐逻辑对 decoder 的冲击较大。结构流程上已尽可能对齐 Qwen 官方方案。
 
+## 📂 数据集准备 (Dataset Preparation)
+
+请在开始训练前下载并准备好以下数据集：
+
+1. **Stage 0 (文本预训练数据)**
+   - **来源**: [ModelScope - minimind_dataset](https://www.modelscope.cn/datasets/gongjy/minimind_dataset/files)
+   - **文件**: `pretrain_hq.jsonl`
+2. **Stage 1 & 2 (视觉-语言对齐与 SFT 数据)**
+   - **来源**: [HuggingFace - minimind-v_dataset](https://huggingface.co/datasets/jingyaogong/minimind-v_dataset/tree/main)
+   - **文件**:
+     - `pretrain_i2t.parquet` (用于 Stage 1 视觉投影层训练)
+     - `sft_i2t.parquet` (用于 Stage 2 全量指令微调)
+
 ## 🚀 训练流程 (Workflow)
 
 训练分为三个阶段，请严格按照以下顺序执行：
