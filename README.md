@@ -38,7 +38,7 @@ python extract.py
 
 预训练装有交错式 MRoPE 逻辑的文本 Decoder。
 
-- **注意**：在 `model_minimind_modforVL`的` MiniMindConfig` 中将默认`vocab_size` 设置为 **6400**（此时无视觉占位符）。
+- **注意**：在 `model/model_minimind_modforVL.py`的` MiniMindConfig` 中将默认`vocab_size` 设置为 **6400**（此时无视觉占位符）。
 
 ```
 python trainer/train_stage0.py
@@ -48,7 +48,7 @@ python trainer/train_stage0.py
 
 运行脚本以扩展视觉占位符。
 
-- **操作**：建议将 `model_minimind_modforVL`的` MiniMindConfig` 中的默认 `vocab_size` 更新为 **6403**，不过扩展后会自动提取出config.json，后续训练脚本均读取的config.json，不修改默认config也可以。
+- **操作**：建议将 `model/model_minimind_modforVL.py`的` MiniMindConfig` 中的默认 `vocab_size` 更新为 **6403**，不过扩展后会自动提取出config.json，后续训练脚本均读取的config.json，不修改默认config也可以。
 
 ```
 python model/expand_tokenizer.py
