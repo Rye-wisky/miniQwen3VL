@@ -1,6 +1,6 @@
 # MiniQwen3VL
 
-本项目是对 [MiniMind](https://www.google.com/search?q=https://github.com/KMnO4-zx/MiniMind) 框架的深度魔改版。受到 QwenVL 系列（特别是 Qwen3VL）报告的启发，本项目在轻量级 decoder（~90M）的基础上，集成了多项多模态前沿技术，旨在探索超小规模参数下的视觉-语言理解极限。
+本项目是对 [MiniMind](https://github.com/jingyaogong/minimind) 模型的深度魔改版。受到 QwenVL 系列（特别是 Qwen3VL）报告的启发，本项目在轻量级 decoder（~90M）的基础上，集成了多项多模态前沿技术，旨在探索超小规模参数下的视觉-语言理解极限。
 
 ## 🌟 项目亮点 (Highlights)
 
